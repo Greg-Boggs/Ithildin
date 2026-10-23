@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# Stand-in for the Upsun CLI used by tests/run-tests.sh. Each "project" is a local docker
+# container named strider-test-<project>; `upsun ssh` runs the command inside it.
+# A project whose container doesn't exist behaves like an unreachable environment.
+
+cmd=$1; shift
+P=""; PROP=""
+while [ $# -gt 0 ]; do
+  case $1 in
+    -p) P=$2; shift 2 ;;
+    -e|-A) shift 2 ;;
+    --) shift; break ;;
+    -*) shift ;;
+    *) PROP=$1; shift ;;
+  esac
+done
+
+case $cmd in
+  project:list) docker ps --format '{{.Names}}' | sed -n 's/^strider-test-//p' ;;
+  project:info) case $PROP in title) echo "Test site $P" ;; *) echo main ;; esac ;;
+  app:list) ;;          # single-app project
+  environment:url) ;;   # no URL: seed-upsun.sh plants files but sends no traffic
+  ssh)
+    docker inspect "strider-test-$P" >/dev/null 2>&1 || { echo "stub upsun: no environment for $P" >&2; exit 255; }
+    exec docker exec -i "strider-test-$P" sh -c "$*"
+    ;;
+  *) echo "stub upsun: unsupported command $cmd" >&2; exit 2 ;;
+esac
