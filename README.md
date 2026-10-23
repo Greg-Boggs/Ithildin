@@ -23,7 +23,24 @@ Each app gets a verdict:
 
 ## What it checks
 
-PHP version, known attacker IPs, `PHP_SESSION_UPLOAD_PROGRESS` in requests, PUT/PATCH and POST bursts, PHP crashes and memory errors, tampered session files, new files and webshells in writable folders, suspicious processes, crontab and SSH keys, shell history, and new Drupal admins or modules. The report's "What we checked" table explains each one. Noise limits are at the top of `strider.sh`.
+| Check | How | What it can miss |
+|---|---|---|
+| PHP version | Compares the running PHP with the fixed release for its branch (8.5.12, 8.4.27, 8.3.36, 8.2.35). | Reads the command-line PHP. On Upsun the web server uses the same build. |
+| Log coverage | The access log must reach back to the start of the window. | Only the access log is checked for trimming. |
+| Known attacker IPs | Exact match of each client IP against the 6 addresses Amazon published. | Behind a CDN the log may hold the CDN's address. A miss proves nothing. |
+| Upload-progress field | Searches the access and error logs for `PHP_SESSION_UPLOAD_PROGRESS`. | Logs don't record POST bodies, so it only catches the field in a URL. |
+| PUT/PATCH and POST bursts | Flags any PUT/PATCH, and 5+ POSTs from one client to the same page within 10 minutes. | An attacker spread across many IPs stays under the limit. |
+| Crashes and memory errors | Worker crashes always flag; memory and timeout errors flag at 20+. | Not limited to the window. Logs could have been edited. |
+| PHP session store | Session files with PHP code, `upload_progress_` keys or malformed IDs. | Reads the session folder the command-line PHP uses. |
+| Files written | Script, `.htaccess` and hidden files changed in the window, in writable mounts, `/tmp` and `/dev/shm`. Drupal's own generated files are set aside. | Timestamps can be forged. |
+| Webshells | Pattern match for code that runs commands from a request, in files under 2 MB. | Obfuscated shells. |
+| Processes | One snapshot: shells, downloaders, anything running from `/tmp`. | Anything that already exited. Upsun workers aren't scanned yet. |
+| Persistence | The web user's crontab and changed `~/.ssh` keys. | Upsun crons live in the app config, not crontab. |
+| Shell history | Downloaders, reverse shells, `base64 -d`, `chmod +x`, crontab or `authorized_keys` edits. | A webshell's commands never reach shell history. |
+| Drupal accounts | Administrators created or changed in the window, ignoring a site install's first hour. | Only the `administrator` role. |
+| Drupal modules | Enabled modules compared with exported `core.extension.yml`. | Needs exported config. |
+
+Noise limits are at the top of `strider.sh`.
 
 ## Other hosts, copied logs, ddev
 
