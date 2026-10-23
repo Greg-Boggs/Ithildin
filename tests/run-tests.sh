@@ -172,6 +172,8 @@ setup_compromised() {
 setup_trimmed() {
   start trimmed || return 1
   normal_traffic 20 | put trimmed /var/log/access.log   # starts 20 Oct, window starts 17 Oct
+  # No PHP-FPM pool files, as on Upsun's PHP 7.4 images: the checks must still run to the end.
+  docker exec strider-test-trimmed sh -c 'rm -f /etc/php/*/fpm/pool.d/*.conf'
   : | put trimmed /var/log/app.log
 }
 
@@ -301,6 +303,7 @@ echo "access log trimmed by Upsun"
 R=$(STRIDER_FIXED_VERSIONS=8.4.24 run_strider trimmed -p trimmed)
 expect_status "$R" trimmed INCOMPLETE
 expect_flag "$R" trimmed LOGS-TRIMMED
+expect_no_flag "$R" trimmed CONTAINER-CHECKS-INCOMPLETE
 
 echo "no access log"
 R=$(STRIDER_FIXED_VERSIONS=8.4.24 run_strider nologs -p nologs)

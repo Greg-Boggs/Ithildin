@@ -97,6 +97,8 @@ APPDIR=${APPDIR:-$3}
 LOGDIR=$4
 cd "$APPDIR" 2>/dev/null || true
 count() { [ -z "$1" ] && echo 0 || printf '%s\n' "$1" | wc -l | tr -d ' '; }
+# This script arrives on stdin (bash -s), so any command that reads stdin would swallow the rest of
+# it: grep with an empty file list, drush, php-fpm. Those get </dev/null.
 
 echo "### PHP version"
 php -r 'echo PHP_VERSION, "\n";' 2>&1
@@ -116,11 +118,11 @@ FPM=$(command -v "php-fpm$PHPMM" php-fpm 2>/dev/null | head -1)
 if [ -z "$FPM" ]; then
   for c in "/usr/sbin/php-fpm$PHPMM" /usr/sbin/php-fpm /usr/local/sbin/php-fpm; do [ -x "$c" ] && { FPM=$c; break; }; done
 fi
-FPMINFO=$([ -n "$FPM" ] && "$FPM" -i 2>/dev/null)
+FPMINFO=$([ -n "$FPM" ] && "$FPM" -i 2>/dev/null </dev/null)
 POOLS=$(ls /etc/php/"$PHPMM"/fpm/pool.d/*.conf /etc/php-fpm.d/*.conf /usr/local/etc/php-fpm.d/*.conf 2>/dev/null | sort -u)
 onoff() { case $(printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -d '"'"'"' ') in 1|on|true|yes) echo 1 ;; ''|0|off|false|no|none) echo 0 ;; *) echo "$1" ;; esac; }
 effective() {   # $1 = setting; prints "value|source", value empty when this PHP has no such setting
-  pv=$(grep -hE "^[[:space:]]*php_(admin_)?(value|flag)\[$1\]" $POOLS 2>/dev/null | tail -1 | sed 's/^[^=]*=[[:space:]]*//; s/[[:space:]]*$//')
+  pv=$([ -n "$POOLS" ] && grep -hE "^[[:space:]]*php_(admin_)?(value|flag)\[$1\]" $POOLS 2>/dev/null </dev/null | tail -1 | sed 's/^[^=]*=[[:space:]]*//; s/[[:space:]]*$//')
   if [ -n "$pv" ]; then echo "$(onoff "$pv")|fpm-pool"; return; fi
   fv=$(printf '%s\n' "$FPMINFO" | awk -F' => ' -v k="$1" '$1 == k {print $2; exit}')
   if [ -n "$fv" ]; then echo "$(onoff "$fv")|fpm"; return; fi
@@ -140,10 +142,13 @@ for k in session.upload_progress.enabled:0:$UPROG:$UPROGSRC session.use_strict_m
 done
 FEBON=$([ "$FEB" = 1 ] && echo 1 || echo 0)
 echo "--- .user.ini files setting these (the advisories say not to rely on them)"
-USERINI=$(grep -rnE --include=.user.ini '^[[:space:]]*(session\.upload_progress\.enabled|session\.use_strict_mode|fatal_error_backtraces)' "$APPDIR" 2>/dev/null | head -20)
+# find -xdev stays out of the writable mounts: uploads can run to gigabytes, and walking them
+# can outlast the host's ssh session.
+USERINI=$(find "$APPDIR" -xdev -name node_modules -prune -o -name .user.ini -type f -print0 2>/dev/null | xargs -0 -r grep -HnE '^[[:space:]]*(session\.upload_progress\.enabled|session\.use_strict_mode|fatal_error_backtraces)' 2>/dev/null | head -20)
 echo "${USERINI:-(none)}"
 echo "--- code that switches session.serialize_handler at runtime (CVE-2026-115560 needs this with upload progress on)"
-SERSWITCH=$(grep -rnE "ini_set\([[:space:]]*['\"]session\.serialize_handler" "$APPDIR" --include='*.php' --include='*.module' --include='*.inc' --include='*.install' --include='*.theme' --exclude-dir=node_modules --exclude-dir=.git 2>/dev/null | head -20)
+SERSWITCH=$(find "$APPDIR" -xdev \( -name node_modules -o -name .git \) -prune -o -type f \( -name '*.php' -o -name '*.module' -o -name '*.inc' -o -name '*.install' -o -name '*.theme' \) -print0 2>/dev/null |
+  xargs -0 -r grep -HnE "ini_set\([[:space:]]*['\"]session\.serialize_handler" 2>/dev/null | head -20)
 echo "${SERSWITCH:-(none)}"
 
 echo
@@ -285,9 +290,10 @@ ps auxf 2>/dev/null || ps aux
 # --- Drupal -------------------------------------------------------------------
 NEWUSERS=0; NEWADMINS=0; NEWMODULES=0; NOEXPORT=0
 DRUSH=$(command -v drush 2>/dev/null || { [ -x vendor/bin/drush ] && echo vendor/bin/drush; })
-if [ -n "$DRUSH" ] && $DRUSH status --field=bootstrap 2>/dev/null | grep -qi success; then
+dr() { "$DRUSH" "$@" </dev/null; }
+if [ -n "$DRUSH" ] && dr status --field=bootstrap 2>/dev/null | grep -qi success; then
   TS=$(date -u -d "$SINCE" +%s 2>/dev/null || echo 0)
-  DV=$($DRUSH status --field=drupal-version 2>/dev/null)
+  DV=$(dr status --field=drupal-version 2>/dev/null)
   echo
   echo "### Drupal $DV"
   case $DV in
@@ -298,7 +304,7 @@ if [ -n "$DRUSH" ] && $DRUSH status --field=bootstrap 2>/dev/null | grep -qi suc
   # Accounts made by a site install (or an environment rebuild) inside the window aren't news:
   # skip anything from the first hour after uid 1 was created.
   BASE=$TS
-  INSTALLED=$($DRUSH sql:query "SELECT created FROM $UT WHERE uid = 1" 2>/dev/null | head -1 | tr -d '[:space:]')
+  INSTALLED=$(dr sql:query "SELECT created FROM $UT WHERE uid = 1" 2>/dev/null | head -1 | tr -d '[:space:]')
   if [ -n "$INSTALLED" ] && [ "$INSTALLED" -ge "$TS" ] 2>/dev/null; then
     BASE=$((INSTALLED + 3600))
     echo "Site installed $(date -u -d "@$INSTALLED" +%Y-%m-%dT%H:%M:%SZ), inside the window; accounts from its first hour are not counted."
@@ -308,20 +314,20 @@ if [ -n "$DRUSH" ] && $DRUSH status --field=bootstrap 2>/dev/null | grep -qi suc
   echo "### Drupal: users created or changed since $(date -u -d "@$BASE" +%Y-%m-%dT%H:%M:%SZ)"
   if [ "$UT" = users ]; then
     # Drupal 7 has no "changed" column; access/login show recent use.
-    U=$($DRUSH sql:query "SELECT uid, name, mail, status, FROM_UNIXTIME(created), FROM_UNIXTIME(access), FROM_UNIXTIME(login) FROM users WHERE uid > 0 AND created >= $BASE ORDER BY created DESC" 2>&1)
+    U=$(dr sql:query "SELECT uid, name, mail, status, FROM_UNIXTIME(created), FROM_UNIXTIME(access), FROM_UNIXTIME(login) FROM users WHERE uid > 0 AND created >= $BASE ORDER BY created DESC" 2>&1)
   else
-    U=$($DRUSH sql:query "SELECT uid, name, mail, status, FROM_UNIXTIME(created), FROM_UNIXTIME(changed), FROM_UNIXTIME(login) FROM users_field_data WHERE created >= $BASE OR changed >= $BASE ORDER BY changed DESC" 2>&1)
+    U=$(dr sql:query "SELECT uid, name, mail, status, FROM_UNIXTIME(created), FROM_UNIXTIME(changed), FROM_UNIXTIME(login) FROM users_field_data WHERE created >= $BASE OR changed >= $BASE ORDER BY changed DESC" 2>&1)
   fi
   echo "${U:-(none)}"
   NEWUSERS=$(printf '%s\n' "$U" | grep -cE '^[0-9]+[[:space:]]')
-  UTOTAL=$($DRUSH sql:query "SELECT COUNT(*) FROM $UT WHERE uid > 0" 2>/dev/null | head -1 | tr -d '[:space:]')
+  UTOTAL=$(dr sql:query "SELECT COUNT(*) FROM $UT WHERE uid > 0" 2>/dev/null | head -1 | tr -d '[:space:]')
 
   echo
   echo "### Drupal: administrators (cols: uid name mail created changed-or-access)"
   if [ "$UT" = users ]; then
-    ADMINS=$($DRUSH sql:query "SELECT u.uid, u.name, u.mail, u.created, u.access FROM $RJ WHERE $RW ORDER BY u.created DESC" 2>&1)
+    ADMINS=$(dr sql:query "SELECT u.uid, u.name, u.mail, u.created, u.access FROM $RJ WHERE $RW ORDER BY u.created DESC" 2>&1)
   else
-    ADMINS=$($DRUSH sql:query "SELECT u.uid, u.name, u.mail, u.created, u.changed FROM $RJ WHERE $RW ORDER BY u.changed DESC" 2>&1)
+    ADMINS=$(dr sql:query "SELECT u.uid, u.name, u.mail, u.created, u.changed FROM $RJ WHERE $RW ORDER BY u.changed DESC" 2>&1)
   fi
   echo "${ADMINS:-(none)}"
   ATOTAL=$(printf '%s\n' "$ADMINS" | grep -cE '^[0-9]+[[:space:]]')
@@ -333,10 +339,10 @@ if [ -n "$DRUSH" ] && $DRUSH status --field=bootstrap 2>/dev/null | grep -qi suc
     # differences are normal while a site is being built and are shown for context only.
     echo
     echo "### Drupal: modules enabled in the database but not in exported config"
-    ROOT=$($DRUSH status --field=root 2>/dev/null)
-    SYNC=$($DRUSH php:eval 'echo \Drupal\Core\Site\Settings::get("config_sync_directory");' 2>/dev/null)
+    ROOT=$(dr status --field=root 2>/dev/null)
+    SYNC=$(dr php:eval 'echo \Drupal\Core\Site\Settings::get("config_sync_directory");' 2>/dev/null)
     case $SYNC in /*) ;; ?*) SYNC="$ROOT/$SYNC" ;; esac
-    ENABLED=$($DRUSH pm:list --type=module --status=enabled --field=name 2>/dev/null | sort -u)
+    ENABLED=$(dr pm:list --type=module --status=enabled --field=name 2>/dev/null | sort -u)
     MODN=$(printf '%s\n' "$ENABLED" | sed '/^$/d' | wc -l | tr -d ' ')
     if [ -n "$SYNC" ] && [ -f "$SYNC/core.extension.yml" ]; then
       EXPORTED=$(awk '/^module:/ {m = 1; next} /^[^ ]/ {m = 0} m && /^  [A-Za-z0-9_]+:/ {sub(/^  /, ""); sub(/:.*/, ""); print}' "$SYNC/core.extension.yml" | sort -u)
@@ -350,7 +356,7 @@ if [ -n "$DRUSH" ] && $DRUSH status --field=bootstrap 2>/dev/null | grep -qi suc
     fi
     echo
     echo "### Drupal: config status (context only)"
-    $DRUSH config:status 2>&1 | head -200
+    dr config:status 2>&1 | head -200
   fi
 
 else
