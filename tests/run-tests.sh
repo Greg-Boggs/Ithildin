@@ -15,7 +15,7 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 STRIDER="$HERE/../strider.sh"
 IMAGE="${STRIDER_TEST_IMAGE:-ddev/ddev-webserver:v1.25.4}"
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/strider-tests.XXXXXX")
-SCENARIOS="clean compromised trimmed nologs althost"
+SCENARIOS="clean compromised trimmed nologs althost settings"
 FAILS=0
 
 cleanup() {
@@ -69,6 +69,12 @@ start() {   # $1 = scenario
   docker run -d --name "strider-test-$1" --no-healthcheck --entrypoint sleep -e PLATFORM_APP_DIR=/app \
     -v "$WORK/$1/files:/app/web/sites/default/files" -v "$WORK/$1/private:/app/private" "$IMAGE" infinity >/dev/null || return 1
   docker exec "strider-test-$1" sh -c 'mkdir -p /app/web/core /var/lib/php/sessions && echo "<?php // index" > /app/web/index.php && touch -d "2026-10-01 00:00Z" /app/web/index.php'
+  good_settings "$1"
+}
+# The required PHP settings, set correctly for both the CLI and PHP-FPM of every PHP in the image.
+good_settings() {
+  docker exec "strider-test-$1" sh -c 'for d in /etc/php/*/cli/conf.d /etc/php/*/fpm/conf.d; do
+    printf "session.upload_progress.enabled=0\nsession.use_strict_mode=1\nfatal_error_backtraces=0\n" > "$d/99-strider.ini"; done 2>/dev/null'
 }
 put() {   # $1 = scenario, $2 = path in container; content on stdin
   docker exec -i "strider-test-$1" sh -c "mkdir -p \"\$(dirname '$2')\" && cat > '$2'"
@@ -120,6 +126,12 @@ setup_clean() {
   printf '2026-10-18T10:00:00Z GET 200 12.0 ms 4096 kB 40.00%% /\n' | put clean /var/log/php.access.log
   printf '[19-Oct-2026 12:00:00 UTC] PHP Fatal error:  Allowed memory size of 268435456 bytes exhausted\n%.0s' 1 2 | put clean /var/log/php.log
   : | put clean /var/log/app.log
+  {
+    echo '[10-Oct-2026 09:00:00 UTC] PHP Fatal error:  Uncaught Error: before the window'
+    echo '[19-Oct-2026 12:00:00 UTC] PHP Fatal error:  Uncaught Error: Call to undefined function foo()'
+    echo '2026/10/19 12:05:00 [error] 12#12: *1 FastCGI sent in stderr: "PHP message: PHP Parse error:  syntax error, unexpected end of file"'
+    echo '[19-Oct-2026 12:10:00 UTC] PHP Warning:  Module "redis" is already loaded in Unknown on line 0'
+  } | put clean /var/log/error.log
   # Twig's compiled templates are PHP files in files/ and change constantly; must not flag.
   echo '<?php /* twig */ class __TwigTemplate_abc {}' | put clean /app/web/sites/default/files/php/twig/68f_page.html.twig_X/HUahq2bIbIkW2GaTzAnI5F7EpODLQc0SUhAhI4kSmlQ.php
   echo '<?php class Drupal__node__NodeStorageTrash6ad8 extends \Drupal\node\NodeStorage {}' | put clean /app/private/trash/Drupal__node__NodeStorageTrash6ad8/7rPMVf0yTeSzV8U7IeeiD7kPVAA75S7Lyh-PGF4i1Lo.php
@@ -140,6 +152,8 @@ setup_compromised() {
   {
     for i in 1 2 3; do echo "[21-Oct-2026 04:0$i:00] WARNING: [pool web] child 10$i exited on signal 11 (SIGSEGV) after 0.3 seconds from start"; done
     for i in $(seq 1 25); do echo "[21-Oct-2026 04:05:$((i + 10))] PHP Fatal error:  Allowed memory size of 134217728 bytes exhausted"; done
+    for i in $(seq 10 21); do echo "[21-Oct-2026 04:06:$i] PHP Fatal error:  Uncaught TypeError: x() in /app/web/index.php:3"; done
+    for i in $(seq 30 41); do echo "[21-Oct-2026 04:06:$i] PHP Warning:  PHP Startup: Unable to load dynamic library in Unknown on line 0"; done
   } | put compromised /var/log/app.log
   : | put compromised /var/log/php.log
   echo '<?php @eval(base64_decode($_POST["c"])); ?>' | put compromised /app/web/sites/default/files/x.php
@@ -166,10 +180,25 @@ setup_althost() {
   mkdir -p "$WORK/althost/files"
   docker run -d --name strider-test-althost --no-healthcheck --entrypoint sleep -e SITE_ROOT=/srv/www \
     -v "$WORK/althost/files:/srv/www/web/sites/default/files" "$IMAGE" infinity >/dev/null || return 1
+  # PHP's defaults left in place, so the required-settings box (and the configured hint) shows.
   { normal_traffic 14; attack_traffic; } | sort -t[ -k2 | put althost /srv/logs/access.log
   for i in 1 2 3; do echo "[21-Oct-2026 04:0$i:00] WARNING: [pool www] child 20$i exited on signal 11 (SIGSEGV)"; done | put althost /srv/logs/php-errors.log
   echo '<?php system($_GET["c"]); ?>' | put althost /srv/www/web/sites/default/files/up.php
   stamp althost /srv/www/web/sites/default/files/up.php "2026-10-21 04:12Z"
+}
+
+# PHP 8.5 whose command line looks right while PHP-FPM is wrong: upload progress and
+# fatal_error_backtraces left on in FPM's ini, strict mode turned back off by a pool override.
+setup_settings() {
+  start settings || return 1
+  normal_traffic 14 | put settings /var/log/access.log
+  : | put settings /var/log/app.log
+  docker exec strider-test-settings sh -c 'update-alternatives --set php /usr/bin/php8.5 >/dev/null 2>&1
+    rm -f /etc/php/8.5/fpm/conf.d/99-strider.ini
+    printf "session.use_strict_mode=1\n" > /etc/php/8.5/fpm/conf.d/98-site.ini
+    printf "php_admin_flag[session.use_strict_mode] = off\n" >> /etc/php/8.5/fpm/pool.d/www.conf'
+  echo 'session.upload_progress.enabled = 0' | put settings /app/web/.user.ini
+  echo '<?php ini_set("session.serialize_handler", "php"); session_start();' | put settings /app/web/modules/custom/legacy/legacy.module
 }
 
 setup_nologs() {
@@ -225,11 +254,11 @@ expect_line "$R/report.html" "What we checked" "report shows what was checked"
 expect_line "$R/report.html" "requests from" "checks table counts requests"
 grep -q 'res flag\|res skip' "$R/report.html" && fail "clean report has a flagged or skipped check" || ok "every check in the clean report is Clean"
 expect_line "$R/report.html" "access-log entries read" "evidence strip present"
-expect_line "$R/report.html" '<div class="todo">' "hardening shown in its own to-do box"
+grep -q '<div class="todo">' "$R/report.html" && fail "clean site with correct settings has a to-do box" || ok "correct settings: no required-settings box"
+expect_line "$R/SUMMARY.txt" "fatal-errors=2" "two fatal errors in the window are only a note (one outside, memory ones excluded)"
+expect_line "$R/SUMMARY.txt" "line0=1" "one startup line-0 warning is only a note"
 expect_line "$R/report.html" 'id="egg"' "moon-letter easter egg present"
 [ -f "$(dirname "$R")/latest/report.html" ] && ok "latest link opens the report" || fail "latest/report.html missing"
-expect_line "$R/report.html" "2 hardening steps to do" "hardening banner under the verdict"
-expect_line "$R/report.html" "session.upload_progress.enabled: 0" "to-do box has the config to paste"
 
 echo "clean site on the image's real PHP 8.4.24 (fixed is 8.4.27)"
 R=$(run_strider unpatched -p clean)
@@ -240,7 +269,7 @@ expect_line "$R/SUMMARY.txt" "NOT PATCHED" "summary says NOT PATCHED"
 echo "compromised site"
 R=$(STRIDER_FIXED_VERSIONS=8.4.24 run_strider compromised -p compromised)
 expect_status "$R" compromised REVIEW
-for f in shell-history=1 drupal-admins-changed=1 modules-not-in-config=1 KNOWN-IPS= PUT/PATCH=2 POST-BURSTS=1 UPLOAD-PROGRESS-FIELD=1 CRASHES=3 MEMORY-ERRORS=25 \
+for f in shell-history=1 drupal-admins-changed=1 modules-not-in-config=1 KNOWN-IPS= PUT/PATCH=2 POST-BURSTS=1 UPLOAD-PROGRESS-FIELD=1 CRASHES=3 MEMORY-ERRORS=25 FATAL-BURSTS=12 LINE0-BURSTS=12 \
          session-files= files= php-in-files=1 shells=1 tmp-exe=1 procs=; do
   expect_flag "$R" compromised "$f"
 done
@@ -250,6 +279,23 @@ expect_line "$R/report.html" "Webshell-like code" "report.html explains the webs
 expect_line "$R/report.html" '<span class="res flag">Flagged</span>' "checks table marks flagged checks"
 expect_line "$R/report.html" "&lt;?php @eval" "report.html escapes evidence"
 grep -qF '<?php @eval' "$R/report.html" && fail "report.html has unescaped evidence" || ok "no unescaped evidence in report.html"
+
+echo "required PHP settings read from PHP-FPM, not just the CLI (PHP 8.5)"
+R=$(STRIDER_FIXED_VERSIONS=8.5.9 run_strider settings -p settings)
+expect_status "$R" settings ACTION
+for f in upload-progress-on strict-mode-off fatal-backtraces-on; do
+  sed -n '/^\[settings\]/,/^$/p' "$R/SUMMARY.txt" | grep -q "required settings to change:.*$f" && ok "settings: $f is required" || fail "settings: $f not listed as required"
+done
+expect_line "$R/settings-main/container.txt" "session.use_strict_mode            required 1   effective 0    (fpm-pool)   cli 1" "pool override beats a correct CLI value"
+expect_line "$R/settings-main/container.txt" "session.upload_progress.enabled    required 0   effective 1    (fpm)   cli 0" "FPM's ini beats a correct CLI value"
+expect_line "$R/settings-main/container.txt" "/app/web/.user.ini" ".user.ini setting is listed"
+expect_line "$R/SUMMARY.txt" "runtime-serializer-switch" "runtime serialize_handler switch is noted"
+expect_line "$R/report.html" "ACTION REQUIRED" "card shows ACTION REQUIRED"
+expect_line "$R/report.html" "1 of 1 app needs required PHP settings changed" "verdict asks for the settings change"
+expect_line "$R/report.html" "3 required settings to change" "banner counts required settings"
+expect_line "$R/report.html" "fatal_error_backtraces: 0" "config to paste includes fatal_error_backtraces"
+expect_line "$R/report.html" '<span class="res todo">Change required</span>' "checks table marks the settings row"
+expect_line "$R/RESULT.txt" "1 need required settings changed" "RESULT counts it"
 
 echo "access log trimmed by Upsun"
 R=$(STRIDER_FIXED_VERSIONS=8.4.24 run_strider trimmed -p trimmed)

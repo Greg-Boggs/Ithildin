@@ -38,6 +38,10 @@ KNOWN_IPS="103.216.220.92 31.223.184.166 37.19.200.5 134.209.159.64 103.114.163.
 POST_BURST=5            # POSTs from one client to the same page...
 POST_BURST_MINUTES=10   # ...within this many minutes
 MEMORY_ERRORS=20        # memory/timeout errors in the logs (worker crashes are always flagged)
+FATAL_BURST=10          # fatal/parse/uncaught errors in the error logs...
+FATAL_BURST_MINUTES=10  # ...within this many minutes, inside the review window
+LINE0_BURST=10          # "in Unknown on line 0" diagnostics (raised before any script runs)...
+LINE0_BURST_MINUTES=10  # ...within this many minutes, inside the review window
 
 usage() {
   sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'
@@ -100,10 +104,47 @@ php -r 'echo PHP_VERSION, "\n";' 2>&1
 echo
 echo "### PHP ini values (CLI)"
 php -r 'foreach (["session.upload_progress.enabled","session.upload_progress.name","session.upload_progress.prefix","session.use_strict_mode","session.save_handler","session.save_path","upload_tmp_dir","post_max_size","upload_max_filesize","memory_limit","fatal_error_backtraces"] as $k) printf("%-35s %s\n", $k, var_export(ini_get($k), true));' 2>&1
-UPROG=$(php -r 'echo (int) ini_get("session.upload_progress.enabled");' 2>/dev/null)
-STRICT=$(php -r 'echo (int) ini_get("session.use_strict_mode");' 2>/dev/null)
 UPREFIX=$(php -r 'echo ini_get("session.upload_progress.prefix");' 2>/dev/null)
 UPREFIX=${UPREFIX:-upload_progress_}
+
+# --- Required PHP settings: the value the web server's PHP actually uses --------------------
+# The CLI and PHP-FPM can load different ini files and FPM pools can override both, so for each
+# setting take the first of: pool override, FPM's ini files, CLI. The advisories say these must be
+# set in php.ini or the pool config; ini_set() and .user.ini don't count.
+PHPMM=$(php -r 'echo PHP_MAJOR_VERSION, ".", PHP_MINOR_VERSION;' 2>/dev/null)
+FPM=$(command -v "php-fpm$PHPMM" php-fpm 2>/dev/null | head -1)
+if [ -z "$FPM" ]; then
+  for c in "/usr/sbin/php-fpm$PHPMM" /usr/sbin/php-fpm /usr/local/sbin/php-fpm; do [ -x "$c" ] && { FPM=$c; break; }; done
+fi
+FPMINFO=$([ -n "$FPM" ] && "$FPM" -i 2>/dev/null)
+POOLS=$(ls /etc/php/"$PHPMM"/fpm/pool.d/*.conf /etc/php-fpm.d/*.conf /usr/local/etc/php-fpm.d/*.conf 2>/dev/null | sort -u)
+onoff() { case $(printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -d '"'"'"' ') in 1|on|true|yes) echo 1 ;; ''|0|off|false|no|none) echo 0 ;; *) echo "$1" ;; esac; }
+effective() {   # $1 = setting; prints "value|source", value empty when this PHP has no such setting
+  pv=$(grep -hE "^[[:space:]]*php_(admin_)?(value|flag)\[$1\]" $POOLS 2>/dev/null | tail -1 | sed 's/^[^=]*=[[:space:]]*//; s/[[:space:]]*$//')
+  if [ -n "$pv" ]; then echo "$(onoff "$pv")|fpm-pool"; return; fi
+  fv=$(printf '%s\n' "$FPMINFO" | awk -F' => ' -v k="$1" '$1 == k {print $2; exit}')
+  if [ -n "$fv" ]; then echo "$(onoff "$fv")|fpm"; return; fi
+  cv=$(php -r "\$v = ini_get('$1'); echo \$v === false ? '@none' : \$v;" 2>/dev/null)
+  if [ "$cv" = "@none" ]; then echo "|cli"; else echo "$(onoff "$cv")|cli"; fi
+}
+IFS='|' read -r UPROG UPROGSRC <<<"$(effective session.upload_progress.enabled)"
+IFS='|' read -r STRICT STRICTSRC <<<"$(effective session.use_strict_mode)"
+IFS='|' read -r FEB FEBSRC <<<"$(effective fatal_error_backtraces)"
+echo
+echo "### Required PHP settings (the value the web server's PHP uses; source: fpm-pool > fpm > cli)"
+echo "PHP-FPM: ${FPM:-not found, so these are the CLI values}${POOLS:+   pools: $(printf '%s\n' "$POOLS" | paste -sd' ' -)}"
+for k in session.upload_progress.enabled:0:$UPROG:$UPROGSRC session.use_strict_mode:1:$STRICT:$STRICTSRC fatal_error_backtraces:0:$FEB:$FEBSRC; do
+  IFS=: read -r name want have src <<<"$k"
+  cli=$(onoff "$(php -r "echo ini_get('$name');" 2>/dev/null)")
+  printf '%-34s required %s   effective %-4s (%s)   cli %s\n' "$name" "$want" "${have:-n/a}" "$src" "$([ -n "$have" ] && echo "$cli" || echo n/a)"
+done
+FEBON=$([ "$FEB" = 1 ] && echo 1 || echo 0)
+echo "--- .user.ini files setting these (the advisories say not to rely on them)"
+USERINI=$(grep -rnE --include=.user.ini '^[[:space:]]*(session\.upload_progress\.enabled|session\.use_strict_mode|fatal_error_backtraces)' "$APPDIR" 2>/dev/null | head -20)
+echo "${USERINI:-(none)}"
+echo "--- code that switches session.serialize_handler at runtime (CVE-2026-115560 needs this with upload progress on)"
+SERSWITCH=$(grep -rnE "ini_set\([[:space:]]*['\"]session\.serialize_handler" "$APPDIR" --include='*.php' --include='*.module' --include='*.inc' --include='*.install' --include='*.theme' --exclude-dir=node_modules --exclude-dir=.git 2>/dev/null | head -20)
+echo "${SERSWITCH:-(none)}"
 
 echo
 echo "### $LOGDIR"
@@ -324,8 +365,8 @@ PROCN=$(ps -e --no-headers 2>/dev/null | wc -l | tr -d ' ')
 CONNN=$(awk 'NR > 1 && $4 == "01"' /proc/net/tcp /proc/net/tcp6 2>/dev/null | wc -l | tr -d ' ')
 CRONN=$(crontab -l 2>/dev/null | grep -cvE '^[[:space:]]*(#|$)')
 echo
-echo "@@STATS php=$(php -r 'echo PHP_VERSION;' 2>/dev/null) sessdir=${SESSDIR:-none} sessions=$SESSN scandirs=$(printf '%s\n' "$SCAN" | paste -sd, -) changed=$(( $(count "$FILES") + $(count "$GENERATED") )) generated=$(count "$GENERATED") shellscan=$SHELLN history=$HISTN procs=$PROCN conns=$CONNN cron=$CRONN drupal=${DV:-none} users=${UTOTAL:-} admins=${ATOTAL:-} modules=${MODN:-} exported=${EXPN:-}"
-echo "@@SUMMARY files=$(count "$FILES") php-in-files=$(count "$PHPINFILES") shells=$(count "$SHELLS") procs=$(count "$PROCS") tmp-exe=$(count "$EXETMP") session-files=$(count "$SESSBAD") ssh-keys-changed=$(count "$KEYS") shell-history=$(count "$HISTBAD") drupal-users-changed=$NEWUSERS drupal-admins-changed=$NEWADMINS modules-not-in-config=$NEWMODULES no-config-export=$NOEXPORT upload-progress-on=${UPROG:-0} strict-mode-off=$([ "${STRICT:-0}" = 1 ] && echo 0 || echo 1)"
+echo "@@STATS uprog=${UPROG:-?}:$UPROGSRC strict=${STRICT:-?}:$STRICTSRC feb=${FEB:-na}:$FEBSRC fpm=$([ -n "$FPM" ] && echo yes || echo no) php=$(php -r 'echo PHP_VERSION;' 2>/dev/null) sessdir=${SESSDIR:-none} sessions=$SESSN scandirs=$(printf '%s\n' "$SCAN" | paste -sd, -) changed=$(( $(count "$FILES") + $(count "$GENERATED") )) generated=$(count "$GENERATED") shellscan=$SHELLN history=$HISTN procs=$PROCN conns=$CONNN cron=$CRONN drupal=${DV:-none} users=${UTOTAL:-} admins=${ATOTAL:-} modules=${MODN:-} exported=${EXPN:-}"
+echo "@@SUMMARY files=$(count "$FILES") php-in-files=$(count "$PHPINFILES") shells=$(count "$SHELLS") procs=$(count "$PROCS") tmp-exe=$(count "$EXETMP") session-files=$(count "$SESSBAD") ssh-keys-changed=$(count "$KEYS") shell-history=$(count "$HISTBAD") drupal-users-changed=$NEWUSERS drupal-admins-changed=$NEWADMINS modules-not-in-config=$NEWMODULES no-config-export=$NOEXPORT upload-progress-on=$([ "$UPROG" = 0 ] && echo 0 || echo 1) strict-mode-off=$([ "$STRICT" = 1 ] && echo 0 || echo 1) fatal-backtraces-on=$FEBON runtime-serializer-switch=$(count "$SERSWITCH")"
 REMOTE
 )
 
@@ -361,6 +402,27 @@ php_is_patched() {
     fi
   done
   return 2   # branch has no fix (unsupported)
+}
+
+# Counts error-log lines matching $1 (minus those matching $2) inside the review window, and the
+# most within any $4 minutes. Prints "in-window busiest start", start "-" when under $3.
+# Understands PHP's "[21-Oct-2026 04:01:00" and nginx/ISO "2026/10/21 04:01:00" timestamps.
+burst_scan() {
+  # shellcheck disable=SC2086
+  cat $LOGS 2>/dev/null | grep -aE "$1" | { if [ -n "$2" ]; then grep -avE "$2"; else cat; fi; } |
+  awk -v f="$FROM" -v t="$TO" 'BEGIN { split("Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec", m, " "); for (i = 1; i <= 12; i++) M[m[i]] = sprintf("%02d", i)
+      split("0 31 59 90 120 151 181 212 243 273 304 334", c, " ") }
+    { iso = ""
+      if (match($0, /[0-9][0-9]-[A-Z][a-z][a-z]-[0-9][0-9][0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]/)) {
+        x = substr($0, RSTART, RLENGTH); iso = substr(x, 8, 4) "-" M[substr(x, 4, 3)] "-" substr(x, 1, 2) "T" substr(x, 13, 8)
+      } else if (match($0, /[0-9][0-9][0-9][0-9][-\/][0-9][0-9][-\/][0-9][0-9][ T][0-9][0-9]:[0-9][0-9]:[0-9][0-9]/)) {
+        x = substr($0, RSTART, RLENGTH); iso = substr(x, 1, 4) "-" substr(x, 6, 2) "-" substr(x, 9, 2) "T" substr(x, 12, 8)
+      }
+      if (iso == "" || iso < f || iso > t) next
+      y = substr(iso, 1, 4) + 0
+      print ((y * 365 + int(y / 4) + c[substr(iso, 6, 2) + 0] + substr(iso, 9, 2)) * 24 + substr(iso, 12, 2)) * 60 + substr(iso, 15, 2), iso }' |
+  sort -n | awk -v n="$3" -v win="$4" '{ tm[e] = $1; ts[e] = $2; e++; while (tm[e - 1] - tm[h] >= win) h++; if (e - h > best) { best = e - h; start = ts[h] } }
+    END { printf "%d %d %s\n", e, best, (best >= n ? start : "-") }'
 }
 
 analyze() {
@@ -477,8 +539,28 @@ analyze() {
       echo "(none)"
     fi
 
+    # GHSA-6wmf-4rv5-p3rp: the attack's first request ends in a fatal error (timeouts and memory are
+    # counted above); its second shows up as diagnostics raised before any script runs.
+    FATALRE='Fatal error|Parse error|Compile Error|Core Error|Uncaught [A-Za-z_\\]*(Error|Exception)|Failed opening required'
+    MEMRE='memory size of|out of memory|Maximum execution time'
+    echo; echo "=== Fatal, parse and uncaught errors in the window ($FATAL_BURST+ within $FATAL_BURST_MINUTES minutes is a burst)"
+    read -r fatalN fatalMax fatalStart <<<"$(burst_scan "$FATALRE" "$MEMRE" "$FATAL_BURST" "$FATAL_BURST_MINUTES")"
+    echo "In the window: $fatalN   busiest $FATAL_BURST_MINUTES minutes: $fatalMax$([ "$fatalStart" != - ] && echo ", starting $fatalStart")"
+    echo "--- last 30 matching lines (all dates)"
     # shellcheck disable=SC2086
-    echo; echo "@@STATS logstart=${first:-} logtotal=${logtotal:-} requests=${total:-} clients=${clients:-} posts=${posts:-} postclients=${postclients:-} putpatch=${putpatch:-} loglines=$(cat $LOGS 2>/dev/null | wc -l | tr -d ' ') ips=$(echo $KNOWN_IPS | wc -w | tr -d ' ')"
+    cat $LOGS 2>/dev/null | grep -aE "$FATALRE" | grep -avE "$MEMRE" | cut -c1-200 | tail -30
+    if [ "$fatalStart" != - ]; then flags="$flags FATAL-BURSTS=$fatalMax"; elif [ "$fatalN" -gt 0 ]; then flags="$flags note:fatal-errors=$fatalN"; fi
+
+    echo; echo "=== Diagnostics 'in Unknown on line 0' in the window ($LINE0_BURST+ within $LINE0_BURST_MINUTES minutes is a burst)"
+    read -r line0N line0Max line0Start <<<"$(burst_scan 'in Unknown on line 0' '' "$LINE0_BURST" "$LINE0_BURST_MINUTES")"
+    echo "In the window: $line0N   busiest $LINE0_BURST_MINUTES minutes: $line0Max$([ "$line0Start" != - ] && echo ", starting $line0Start")"
+    echo "--- last 30 matching lines (all dates)"
+    # shellcheck disable=SC2086
+    cat $LOGS 2>/dev/null | grep -a 'in Unknown on line 0' | cut -c1-200 | tail -30
+    if [ "$line0Start" != - ]; then flags="$flags LINE0-BURSTS=$line0Max"; elif [ "$line0N" -gt 0 ]; then flags="$flags note:line0=$line0N"; fi
+
+    # shellcheck disable=SC2086
+    echo; echo "@@STATS logstart=${first:-} logtotal=${logtotal:-} requests=${total:-} clients=${clients:-} posts=${posts:-} postclients=${postclients:-} putpatch=${putpatch:-} loglines=$(cat $LOGS 2>/dev/null | wc -l | tr -d ' ') ips=$(echo $KNOWN_IPS | wc -w | tr -d ' ') fatal=$fatalN fatalmax=$fatalMax line0=$line0N line0max=$line0Max"
   } > "$r"
   echo "$flags"
 }
@@ -520,8 +602,14 @@ describe() {
     NO-ACCESS-LOG) TITLE="No access log"; WHY="The web traffic checks could not run."; EFILE=analysis; EHEAD="access.log" ;;
     CONTAINER-CHECKS-INCOMPLETE) TITLE="Container checks didn't finish"; WHY="The checks inside the container stopped part way; see container.txt and ssh-errors.txt." ;;
     LOGS-TRIMMED) TITLE="Access log doesn't reach back to the window start"; WHY="$PLATFORM_NAME already discarded the oldest traffic, so the earliest days weren't checked."; EFILE=analysis; EHEAD="access.log starts at" ;;
-    upload-progress-on) TITLE="session.upload_progress.enabled is on"; WHY="Drupal doesn't use it. Set it to 0 in the app's PHP settings ($CONFIG_HINT)."; EHEAD="### PHP ini values" ;;
-    strict-mode-off) TITLE="session.use_strict_mode is off"; WHY="Set it to 1 in the app's PHP settings ($CONFIG_HINT) so PHP rejects made-up session IDs."; EHEAD="### PHP ini values" ;;
+    upload-progress-on) TITLE="session.upload_progress.enabled must be 0"; WHY="Required by both PHP advisories (GHSA-6wmf-4rv5-p3rp, CVE-2026-115560). Drupal doesn't use it. Set it in php.ini or the FPM pool ($CONFIG_HINT); ini_set() and .user.ini don't count."; EHEAD="### Required PHP settings" ;;
+    strict-mode-off) TITLE="session.use_strict_mode must be 1"; WHY="Required by the Drupal Association's guidance, so PHP rejects made-up session IDs. Set it in php.ini or the FPM pool ($CONFIG_HINT)."; EHEAD="### Required PHP settings" ;;
+    fatal-backtraces-on) TITLE="fatal_error_backtraces must be 0 (PHP 8.5)"; WHY="This is the confirmed remote-code-execution path in GHSA-6wmf-4rv5-p3rp. Set it in php.ini or the FPM pool ($CONFIG_HINT) until PHP is patched."; EHEAD="### Required PHP settings" ;;
+    runtime-serializer-switch) TITLE="Code switches session.serialize_handler at runtime"; WHY="With upload progress on, this is the trigger for CVE-2026-115560. Keeping session.upload_progress.enabled at 0 closes it."; EHEAD="--- code that switches" ;;
+    FATAL-BURSTS) TITLE="Burst of fatal errors"; WHY="Many fatal, parse or uncaught errors within minutes. A fatal interruption is the first half of the GHSA-6wmf-4rv5-p3rp attack."; EFILE=analysis; EHEAD="=== Fatal, parse" ;;
+    fatal-errors) TITLE="Fatal errors in the window"; WHY="A few fatal errors happen on any site under development or after a deploy."; EFILE=analysis; EHEAD="=== Fatal, parse" ;;
+    LINE0-BURSTS) TITLE="Burst of 'in Unknown on line 0' diagnostics"; WHY="Warnings raised before any script runs, many within minutes. That is how the second half of the GHSA-6wmf-4rv5-p3rp attack looks in the logs."; EFILE=analysis; EHEAD="=== Diagnostics" ;;
+    line0) TITLE="'in Unknown on line 0' diagnostics"; WHY="A few appear when PHP-FPM starts, for example a module loaded twice."; EFILE=analysis; EHEAD="=== Diagnostics" ;;
     *) TITLE=$1; WHY="" ;;
   esac
 }
@@ -552,12 +640,14 @@ num() { printf '%s' "${1:-0}" | sed -e ':a' -e 's/\([0-9]\)\([0-9]\{3\}\)\($\|,\
 # Result cell for a check: Flagged if any of its keys is under review, Not checked if incomplete.
 result() {   # keys...
   for k in "$@"; do case " $review " in *" $k "*|*" $k="*) echo flag; return ;; esac; done
+  for k in "$@"; do case " $hardening " in *" $k "*) echo action; return ;; esac; done
   for k in "$@"; do case " $incomplete " in *" $k "*|*" $k="*) echo skip; return ;; esac; done
   echo clean
 }
 row() {   # $1 = check, $2 = what was examined, $3 = advisory step, $4 = result, $5 = outcome when clean
   case $4 in
     flag) r='<span class="res flag">Flagged</span>'; o="Flagged; see Findings." ;;
+    action) r='<span class="res todo">Change required</span>'; o="Wrong; see Required settings." ;;
     skip) r='<span class="res skip">Not checked</span>'; o="Not checked." ;;
     info) r='<span class="res info">Not compared</span>'; o="Not compared." ;;
     *)    r='<span class="res clean">Clean</span>'; o=${5:-Nothing found.} ;;
@@ -582,6 +672,8 @@ html_checks() {   # $1 = app dir
   echo '<h3 data-moon="What Strider read in the tracks">What we checked</h3><div class="tw"><table class="checks"><thead><tr><th>Check</th><th>Outcome and what we examined</th><th>Result</th></tr></thead><tbody>'
   if [ -n "$php" ]; then
     row "PHP version" "Running PHP $php; the fixed releases are $FIXED_VERSIONS." "AWS 1" "$(result PHP-UNPATCHED PHP-UNSUPPORTED PHP-UNKNOWN)" "Patched."
+    setting() { v=${1%%:*}; src=${1#*:}; case $v in na|'') echo "not on this PHP" ;; *) echo "$v ($src)" ;; esac; }
+    row "Required PHP settings" "session.upload_progress.enabled $(setting "$(stat "$d" uprog)"), session.use_strict_mode $(setting "$(stat "$d" strict)"), fatal_error_backtraces $(setting "$(stat "$d" feb)"). Values are what the web server's PHP uses: FPM pool overrides first, then FPM's ini files$([ "$(stat "$d" fpm)" = no ] && echo "; PHP-FPM wasn't found, so these are the CLI values")." "PHP advisories" "$(result upload-progress-on strict-mode-off fatal-backtraces-on)" "All correct."
   else
     row "PHP version" "The PHP version could not be read on this run." "AWS 1" skip
   fi
@@ -601,6 +693,10 @@ html_checks() {   # $1 = app dir
   fi
   row "PHP crashes and memory errors" "Searched $(num "$ll") lines of app, error and PHP logs for worker crashes, memory exhaustion and timeouts." "Drupal: error logs" "$(result CRASHES MEMORY-ERRORS)" \
     "$(has_note memory-errors && echo "No crashes; a few memory errors, below the alert level." || echo "None found.")"
+  row "Fatal and parse errors" "Found $(num "$(stat "$d" fatal)") fatal, parse or uncaught $(plural "$(stat "$d" fatal)" error) in the window; the busiest $FATAL_BURST_MINUTES minutes had $(num "$(stat "$d" fatalmax)"). A fatal interruption is the first half of this attack." "PHP advisory" "$(result FATAL-BURSTS)" \
+    "$(has_note fatal-errors && echo "No bursts; a few, below the alert level." || echo "None in the window.")"
+  row "Pre-request diagnostics" "Found $(num "$(stat "$d" line0)") $(plural "$(stat "$d" line0)" warning) reported 'in Unknown on line 0', raised before any script runs; the busiest $LINE0_BURST_MINUTES minutes had $(num "$(stat "$d" line0max)")." "PHP advisory" "$(result LINE0-BURSTS)" \
+    "$(has_note line0 && echo "No bursts; a few, below the alert level." || echo "None in the window.")"
   if [ -n "$php" ]; then
     if [ "${sessn:-0}" = 0 ]; then
       row "PHP session store" "The PHP session store ($sessdir) held no session files to tamper with; Drupal keeps its sessions in the database." "Drupal: session store" "$(result session-files)" "Empty."
@@ -637,24 +733,26 @@ html_card() {   # $1 = status word, $2 = label, $3 = dir, $4 = php line; then $r
   st=$1; rel=${3#"$OUT"/}
   {
     printf '<section class="app %s">\n' "$(echo "$st" | tr '[:upper:]' '[:lower:]')"
-    printf '<header><span class="badge">%s</span><h2>%s</h2><span class="meta">%s</span></header>\n' "$st" "$(printf '%s' "$PTITLE" | esc)" "$(printf '%s · %s' "$2" "$4" | esc)"
+    printf '<header><span class="badge">%s</span><h2>%s</h2><span class="meta">%s</span></header>\n' "$([ "$st" = ACTION ] && echo "ACTION REQUIRED" || echo "$st")" "$(printf '%s' "$PTITLE" | esc)" "$(printf '%s · %s' "$2" "$4" | esc)"
     case $st in
       OK) echo '<p class="lead">Every check ran and none of them found a trace of the exploit.</p>' ;;
       INCOMPLETE) echo '<p class="lead">Nothing was found, but some checks could not run, so this is not proof the app is clean.</p>' ;;
       REVIEW) echo '<p class="lead">These findings need a person to look at them.</p>' ;;
+      ACTION) echo '<p class="lead">No trace of the exploit, but required PHP settings are wrong. Change them and redeploy.</p>' ;;
     esac
     [ -n "$review" ] && { echo '<h3>Findings</h3>'; for kv in $review; do html_item "$3" "$kv"; done; }
     [ -n "$incomplete" ] && { echo '<h3>Not checked</h3>'; for kv in $incomplete; do html_item "$3" "$kv"; done; }
     case $incomplete in could-not-connect) ;; *) html_checks "$3" ;; esac
     if [ -n "$hardening" ]; then
       n=$(echo $hardening | wc -w | tr -d ' ')
-      printf '<div class="todo"><h3>Hardening to do <span class="n">%s</span></h3>\n' "$n"
-      echo '<p>These are not signs of an attack. They are PHP settings the advisory says to change so this exploit has less to work with.</p>'
+      printf '<div class="todo"><h3>Required settings <span class="n">%s</span></h3>\n' "$n"
+      echo '<p>These are not signs of an attack. The PHP and Drupal advisories require these settings, and this app has them wrong.</p>'
       for kv in $hardening; do html_item "$3" "$kv"; done
       printf '<p class="paste">Add this to the app in <code>%s</code>, then redeploy:</p><pre>variables:\n' "$(printf '%s' "$CONFIG_HINT" | esc)"
       echo '  php:'
       case " $hardening " in *" upload-progress-on "*) echo '    session.upload_progress.enabled: 0' ;; esac
       case " $hardening " in *" strict-mode-off "*) echo '    session.use_strict_mode: 1' ;; esac
+      case " $hardening " in *" fatal-backtraces-on "*) echo '    fatal_error_backtraces: 0' ;; esac
       echo '</pre></div>'
     fi
     [ -n "$notes" ] && { echo '<h3 class="muted">For context</h3>'; for kv in $notes; do html_item "$3" "$kv"; done; }
@@ -669,8 +767,8 @@ html_card() {   # $1 = status word, $2 = label, $3 = dir, $4 = php line; then $r
 }
 
 html_page() {
-  N=$((REVIEW_N + INCOMPLETE_N + OK_N))
-  if [ "$REVIEW_N" -eq 0 ] && [ "$INCOMPLETE_N" -eq 0 ]; then
+  N=$((REVIEW_N + ACTION_N + INCOMPLETE_N + OK_N))
+  if [ "$REVIEW_N" -eq 0 ] && [ "$ACTION_N" -eq 0 ] && [ "$INCOMPLETE_N" -eq 0 ]; then
     vmoon="No orc-sign on any path. Strider followed the trail to its end and found it clean."
     vclass=ok; verdict="No trace of the exploit on $([ "$N" -eq 1 ] && echo "the 1 app" || echo "any of the $N apps") checked."
     vsub="Every check ran to completion. The evidence behind that is below."
@@ -678,6 +776,10 @@ html_page() {
     vmoon="Strider has found orc-sign. Follow the tracks below."
     vclass=review; verdict="$REVIEW_N of $N $([ "$N" -eq 1 ] && echo app || echo apps) $([ "$REVIEW_N" -eq 1 ] && echo needs || echo need) a closer look."
     vsub="The findings are listed first, each with the evidence that raised it."
+  elif [ "$ACTION_N" -gt 0 ]; then
+    vmoon="The trail is clean, but a gate stands open. Close it."
+    vclass=action; verdict="No trace of the exploit, but $ACTION_N of $N $([ "$N" -eq 1 ] && echo app || echo apps) $([ "$ACTION_N" -eq 1 ] && echo needs || echo need) required PHP settings changed."
+    vsub="Wrong settings are not signs of an attack. The yellow boxes say what to change."
   else
     vmoon="The trail went cold in places; not every path could be read."
     vclass=incomplete; verdict="Nothing found, but $INCOMPLETE_N of $N $([ "$N" -eq 1 ] && echo app || echo apps) could not be fully checked."
@@ -758,6 +860,9 @@ h1.site { margin:0; font:600 46px/1.1 "Palatino Linotype",Palatino,"Book Antiqua
 .verdict .big { font-size:22px; font-weight:650; line-height:1.3 } .verdict .small { color:var(--muted); margin-top:4px; font-size:14px }
 .verdict.ok { background:var(--ok-bg); border-color:rgba(95,211,154,.35) } .verdict.ok .big { color:var(--ok) }
 .verdict.review { background:var(--rev-bg); border-color:rgba(255,123,114,.35) } .verdict.review .big { color:var(--rev) }
+.verdict.action { background:var(--todo-bg); border-color:rgba(242,211,107,.4) } .verdict.action .big { color:var(--todo) }
+.app.action { border-top-color:var(--todo) } .action .badge { background:var(--todo-bg); color:var(--todo) }
+.res.todo { color:var(--todo); background:var(--todo-bg) }
 .verdict.incomplete { background:var(--inc-bg); border-color:rgba(232,184,92,.35) } .verdict.incomplete .big { color:var(--inc) }
 .todo-banner { display:flex; gap:12px; align-items:flex-start; padding:12px 16px; margin:-4px 0 16px; border-radius:10px;
   background:var(--todo-bg); border:1px solid rgba(242,211,107,.35); color:#e9dfb8; font-size:14px }
@@ -839,8 +944,8 @@ HEAD
     echo '</header>'
     printf '<div class="verdict %s"><div class="big" data-moon="%s">%s</div><div class="small">%s</div></div>\n' "$vclass" "$vmoon" "$verdict" "$vsub"
     if [ "$HARDEN_STEPS" -gt 0 ]; then
-      printf '<div class="todo-banner"><span class="ico" aria-hidden="true">⚑</span><div><b>%s hardening %s to do</b> on %s %s. Not signs of an attack, but worth doing soon: see the yellow %s below.</div></div>\n' \
-        "$HARDEN_STEPS" "$([ "$HARDEN_STEPS" -eq 1 ] && echo step || echo steps)" "$HARDEN_APPS" "$([ "$HARDEN_APPS" -eq 1 ] && echo app || echo apps)" "$([ "$HARDEN_APPS" -eq 1 ] && echo box || echo boxes)"
+      printf '<div class="todo-banner"><span class="ico" aria-hidden="true">⚑</span><div><b>%s required %s to change</b> on %s %s. Not signs of an attack, but the advisories require them: see the yellow %s below.</div></div>\n' \
+        "$HARDEN_STEPS" "$([ "$HARDEN_STEPS" -eq 1 ] && echo setting || echo settings)" "$HARDEN_APPS" "$([ "$HARDEN_APPS" -eq 1 ] && echo app || echo apps)" "$([ "$HARDEN_APPS" -eq 1 ] && echo box || echo boxes)"
     fi
     echo '<div class="stats">'
     printf '<div class="stat"><b>%s</b><span>%s</span></div>' "$N" "$([ "$N" -eq 1 ] && echo "app examined" || echo "apps examined")"
@@ -854,7 +959,7 @@ HEAD
     tile "$t_proc" "processes inspected"
     tile "$t_users" "Drupal accounts reviewed"
     echo '</div>'
-    cat "$OUT/.cards-REVIEW.html" "$OUT/.cards-INCOMPLETE.html" "$OUT/.cards-OK.html" 2>/dev/null
+    cat "$OUT/.cards-REVIEW.html" "$OUT/.cards-ACTION.html" "$OUT/.cards-INCOMPLETE.html" "$OUT/.cards-OK.html" 2>/dev/null
     sed "s/@PLATFORM@/$PLATFORM_NAME/g" <<'TAIL'
 <div class="method">
 <section><h2>How this review was done</h2>
@@ -887,8 +992,8 @@ HEAD
 // Easter egg: click the runes, or type "mellon", for moon-letter mode. Purely cosmetic; findings and evidence don't change.
 (function () {
   var root = document.documentElement, egg = document.getElementById("egg");
-  var words = [[".badge", {OK: "Safe passage", REVIEW: "Orc-sign", INCOMPLETE: "Trail lost"}],
-               [".res", {"Clean": "Unmarked", "Flagged": "Orc-sign", "Not checked": "Trail lost", "Not compared": "Unread"}]];
+  var words = [[".badge", {OK: "Safe passage", REVIEW: "Orc-sign", "ACTION REQUIRED": "Gate unbarred", INCOMPLETE: "Trail lost"}],
+               [".res", {"Clean": "Unmarked", "Flagged": "Orc-sign", "Not checked": "Trail lost", "Not compared": "Unread", "Change required": "Bar the gate"}]];
   function swap(el, alt, on) {
     if (el.dataset.plain === undefined) el.dataset.plain = el.textContent;
     el.textContent = on && alt ? alt : el.dataset.plain;
@@ -922,7 +1027,7 @@ TAIL
 # ---------------------------------------------------------------------------
 # Main loop.
 # ---------------------------------------------------------------------------
-OK_N=0; REVIEW_N=0; INCOMPLETE_N=0; HARDEN_APPS=0; HARDEN_STEPS=0
+OK_N=0; REVIEW_N=0; ACTION_N=0; INCOMPLETE_N=0; HARDEN_APPS=0; HARDEN_STEPS=0
 for P in $PROJECTS; do
   PENV=$ENV
   [ -z "$PENV" ] && PENV=$(platform_default_env "$P" 2>/dev/null </dev/null)
@@ -984,23 +1089,25 @@ for P in $PROJECTS; do
     for kv in $flags $remote; do
       case $kv in
         *=0) ;;
-        upload-progress-on=*|strict-mode-off=*) hardening="$hardening ${kv%=*}" ;;
+        upload-progress-on=*|strict-mode-off=*|fatal-backtraces-on=*) hardening="$hardening ${kv%=*}" ;;
         note:*) notes="$notes ${kv#note:}" ;;
-        drupal-users-changed=*|no-config-export=*) notes="$notes ${kv%=1}" ;;
+        drupal-users-changed=*|no-config-export=*|runtime-serializer-switch=*) notes="$notes ${kv%=1}" ;;
         NO-ACCESS-LOG|CONTAINER-CHECKS-INCOMPLETE|LOGS-TRIMMED|PHP-UNKNOWN|LOGS-ONLY) incomplete="$incomplete $kv" ;;
         *) review="$review $kv" ;;
       esac
     done
 
+    # REVIEW (signs of attack) outranks ACTION (required settings wrong), which outranks INCOMPLETE.
     if [ -n "$review" ]; then status="REVIEW:$review"; REVIEW_N=$((REVIEW_N + 1))
+    elif [ -n "$hardening" ]; then status="ACTION:$hardening"; ACTION_N=$((ACTION_N + 1))
     elif [ -n "$incomplete" ]; then status="INCOMPLETE:$incomplete"; INCOMPLETE_N=$((INCOMPLETE_N + 1))
     else status="OK"; OK_N=$((OK_N + 1)); fi
-    [ -n "$review" ] && [ -n "$incomplete" ] && status="$status (also incomplete:$incomplete)"
+    [ -n "$review$hardening" ] && [ -n "$incomplete" ] && status="$status (also incomplete:$incomplete)"
     {
       echo "[$label] PHP $phpv ($patch)"
       echo "    $status"
       [ -n "$notes" ] && echo "    notes (normal in small numbers):$notes"
-      [ -n "$hardening" ] && echo "    hardening to fix:$hardening"
+      [ -n "$hardening" ] && echo "    required settings to change:$hardening"
       echo "    details: $dir/analysis.txt, $dir/container.txt"
       echo
     } >> "$SUMMARY"
@@ -1010,10 +1117,10 @@ for P in $PROJECTS; do
 done
 
 {
-  if [ "$REVIEW_N" -eq 0 ] && [ "$INCOMPLETE_N" -eq 0 ]; then
+  if [ "$REVIEW_N" -eq 0 ] && [ "$ACTION_N" -eq 0 ] && [ "$INCOMPLETE_N" -eq 0 ]; then
     echo "RESULT: all $OK_N apps OK - nothing unusual found."
   else
-    echo "RESULT: $REVIEW_N to review, $INCOMPLETE_N incomplete, $OK_N OK."
+    echo "RESULT: $REVIEW_N to review, $ACTION_N need required settings changed, $INCOMPLETE_N incomplete, $OK_N OK."
   fi
   echo
 } | tee -a "$SUMMARY" > "$OUT/RESULT.txt"
@@ -1023,6 +1130,7 @@ sed -e "s/@PLATFORM@/$PLATFORM_NAME/g" -e "s|@CONFIG_HINT@|$CONFIG_HINT|g" >> "$
 Status:
   OK          Every check ran and nothing unusual turned up.
   REVIEW      At least one indicator below. Read analysis.txt / container.txt for that app.
+  ACTION      No trace of an attack, but required PHP settings are wrong and must be changed.
   INCOMPLETE  Nothing found, but some checks couldn't run, so that isn't proof the app is clean.
 
 How to read this (look for clusters of indicators, not single hits):
@@ -1043,7 +1151,7 @@ How to read this (look for clusters of indicators, not single hits):
                      install in the window are not counted). Confirm it was you.
   modules-not-in-config
                      Modules enabled in the database that the exported config doesn't list.
-  notes              memory-errors and drupal-users-changed are normal in small
+  notes              memory-errors, fatal-errors, line0 and drupal-users-changed are normal in small
                      numbers on a busy site; glance at them in container.txt / analysis.txt.
                      no-config-export means the site has no exported module list to compare against.
   NO-ACCESS-LOG      The access log could not be read; the web traffic checks did not run.
@@ -1051,9 +1159,12 @@ How to read this (look for clusters of indicators, not single hits):
   CONTAINER-CHECKS-INCOMPLETE
                      The in-container checks stopped before finishing; see container.txt and ssh-errors.txt.
   LOGS-TRIMMED       @PLATFORM@ already discarded part of the window; a clean result there proves nothing.
-  hardening to fix   Set session.upload_progress.enabled=0 and session.use_strict_mode=1 under
-                     variables: php: in @CONFIG_HINT@. Until PHP is patched, AWS also suggests
-                     blocking multipart uploads where the site doesn't need them; check that first.
+  ACTION / required settings to change
+                     No trace of an attack, but required PHP settings are wrong: session.upload_progress.enabled=0,
+                     session.use_strict_mode=1 and, on PHP 8.5, fatal_error_backtraces=0. Set them in php.ini or the
+                     FPM pool (variables: php: in @CONFIG_HINT@); ini_set() and .user.ini don't count.
+  FATAL-BURSTS       Many fatal/parse/uncaught errors within minutes: the first half of GHSA-6wmf-4rv5-p3rp.
+  LINE0-BURSTS       Many "in Unknown on line 0" diagnostics within minutes: the second half of that attack.
 
 If you find something:
   1. Don't redeploy yet if you can avoid it; the container and its mounts are evidence. Contact @PLATFORM@ support.
