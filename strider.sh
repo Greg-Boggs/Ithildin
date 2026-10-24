@@ -814,29 +814,34 @@ html_page() {
   --moon:#c9d7f2; --moon-dim:#7f93b8; --ok:#5fd39a; --ok-bg:rgba(95,211,154,.10); --rev:#ff7b72; --rev-bg:rgba(255,123,114,.10);
   --inc:#e8b85c; --inc-bg:rgba(232,184,92,.10); --todo:#f2d36b; --todo-bg:rgba(242,211,107,.08); color-scheme:dark; }
 * { box-sizing:border-box }
-body { margin:0; background:var(--bg) radial-gradient(ellipse 900px 380px at 50% -120px, rgba(150,175,230,.13), transparent 70%) no-repeat;
+body { margin:0; background:var(--bg);
   color:var(--fg); font:15px/1.55 system-ui,-apple-system,"Segoe UI",sans-serif; min-height:100vh }
 main { max-width:1040px; margin:0 auto; padding:32px 16px 72px }
-body::before { content:""; position:fixed; inset:0; pointer-events:none; opacity:.55;
+/* The Tolkien decoration (starfield, arch, runes, glow) only shows in moon-letter mode. */
+body::before { content:""; position:fixed; inset:0; pointer-events:none; opacity:0;
   background-image:radial-gradient(1px 1px at 12% 18%, #c9d7f2, transparent), radial-gradient(1px 1px at 78% 9%, #c9d7f2, transparent),
     radial-gradient(1px 1px at 33% 72%, #9fb1d4, transparent), radial-gradient(1.5px 1.5px at 64% 44%, #c9d7f2, transparent),
     radial-gradient(1px 1px at 88% 66%, #9fb1d4, transparent), radial-gradient(1px 1px at 22% 91%, #c9d7f2, transparent),
     radial-gradient(1px 1px at 51% 27%, #9fb1d4, transparent), radial-gradient(1.5px 1.5px at 6% 52%, #c9d7f2, transparent),
     radial-gradient(1px 1px at 94% 31%, #c9d7f2, transparent), radial-gradient(1px 1px at 43% 96%, #9fb1d4, transparent) }
 main { position:relative }
-header.top { position:relative; text-align:center; padding-top:58px; margin-bottom:26px }
+header.top { position:relative; text-align:center; padding-top:8px; margin-bottom:26px }
+header.top .arch, header.top .runes, .brand svg { display:none }
+.moonlit header.top { padding-top:58px }
+.moonlit header.top .runes { display:flex }
+.moonlit .brand svg { display:block }
 header.top .arch { position:absolute; top:-8px; left:50%; transform:translateX(-50%); width:min(100%, 820px); height:auto; pointer-events:none }
 header.top .brand { justify-content:center }
 .brand { display:flex; align-items:center; gap:10px; margin-bottom:14px; color:var(--moon); font-size:13px; letter-spacing:.22em; text-transform:uppercase; font-weight:600 }
 .brand svg { flex:none; filter:drop-shadow(0 0 6px rgba(201,215,242,.45)) }
 .brand .kind { color:var(--muted); font-weight:400; letter-spacing:.12em }
-h1.site { margin:0; font:600 46px/1.1 "Palatino Linotype",Palatino,"Book Antiqua","URW Palladio L",Georgia,serif; color:#f3f5fa;
-  letter-spacing:.01em; overflow-wrap:anywhere; text-shadow:0 0 28px rgba(150,175,230,.25) }
+h1.site { margin:0; font:650 40px/1.15 system-ui,-apple-system,"Segoe UI",sans-serif; color:#f3f5fa; letter-spacing:-.01em; overflow-wrap:anywhere }
+.moonlit h1.site { font:600 46px/1.1 "Palatino Linotype",Palatino,"Book Antiqua","URW Palladio L",Georgia,serif; letter-spacing:.01em }
 .siteinfo { margin:8px 0 0; color:var(--muted); font-size:14px } .siteinfo b { color:var(--fg); font-weight:600 }
 .runes { display:flex; align-items:center; gap:14px; margin:18px 0 14px; color:var(--moon-dim); opacity:.75 }
 .runes::before, .runes::after { content:""; flex:1; height:1px; background:linear-gradient(90deg, transparent, var(--moon-dim), transparent) }
 .runes span { font-size:15px; letter-spacing:.5em; padding-left:.5em; text-shadow:0 0 10px rgba(201,215,242,.5) }
-@media (max-width:640px) { h1.site { font-size:34px } header.top { padding-top:40px } }
+@media (max-width:640px) { h1.site { font-size:34px } .moonlit header.top { padding-top:40px } }
 #egg { background:none; border:0; padding:4px 0 4px .5em; font:inherit; font-size:15px; letter-spacing:.5em; color:inherit; cursor:pointer;
   text-shadow:0 0 10px rgba(201,215,242,.5); transition:color .4s, text-shadow .4s }
 #egg:hover, #egg:focus-visible { color:var(--moon); text-shadow:0 0 14px rgba(201,215,242,.95); outline:none }
@@ -846,8 +851,8 @@ h1.site { margin:0; font:600 46px/1.1 "Palatino Linotype",Palatino,"Book Antiqua
 .moonlit body { background:var(--bg) radial-gradient(ellipse 1000px 520px at 50% -140px, rgba(170,195,245,.26), transparent 70%) no-repeat }
 .moonlit body::after { content:""; position:fixed; top:36px; right:6vw; width:84px; height:84px; border-radius:50%; pointer-events:none;
   box-shadow:inset -18px 6px 0 0 #e8eefb; filter:drop-shadow(0 0 22px rgba(220,230,255,.55)); opacity:.85; animation:rise 2.4s ease-out both }
-.moonlit body::before { animation:twinkle 3.2s ease-in-out infinite alternate }
-.moonlit header.top .arch { filter:brightness(2.2) drop-shadow(0 0 6px rgba(201,215,242,.9)); animation:glow 4s ease-in-out infinite alternate }
+.moonlit body::before { opacity:.55; animation:twinkle 3.2s ease-in-out infinite alternate }
+.moonlit header.top .arch { display:block; filter:brightness(2.2) drop-shadow(0 0 6px rgba(201,215,242,.9)); animation:glow 4s ease-in-out infinite alternate }
 .moonlit h1.site { text-shadow:0 0 22px rgba(201,215,242,.85), 0 0 2px #fff; animation:glow 4s ease-in-out infinite alternate }
 .moonlit .moonletters { opacity:.95; height:auto; text-shadow:0 0 12px rgba(201,215,242,.8) }
 .moonlit h3, .moonlit .method h2 { font-family:"Palatino Linotype",Palatino,Georgia,serif; text-transform:none; letter-spacing:.02em; font-size:14px;
@@ -875,7 +880,7 @@ h1.site { margin:0; font:600 46px/1.1 "Palatino Linotype",Palatino,"Book Antiqua
 .todo-banner b { color:var(--todo) } .todo-banner .ico { color:var(--todo); font-size:18px; line-height:1.2 }
 .todo { margin:20px 0 4px; padding:4px 16px 14px; border-radius:10px; background:var(--todo-bg); border:1px solid rgba(242,211,107,.35);
   border-left:4px solid var(--todo) }
-.todo h3 { color:var(--todo) } .todo h3::before { content:"⚑"; color:var(--todo); opacity:1 }
+.todo h3 { color:var(--todo) } .todo h3::before, .moonlit .todo h3::before { content:"⚑"; margin-right:8px; color:var(--todo); opacity:1 }
 .todo h3 .n { background:rgba(242,211,107,.18); color:var(--todo); text-transform:none; letter-spacing:0 }
 .todo > p { margin:0 0 6px; color:#d9d2b4; font-size:13.5px } .todo details { border-top-color:rgba(242,211,107,.2) }
 .todo summary .t { color:var(--todo) } .todo .paste { margin-top:12px } .todo code { color:var(--todo) }
@@ -896,7 +901,7 @@ h1.site { margin:0; font:600 46px/1.1 "Palatino Linotype",Palatino,"Book Antiqua
 .incomplete .badge { background:var(--inc-bg); color:var(--inc) }
 .lead { margin:8px 0 4px; color:var(--fg) }
 h3 { font-size:12px; text-transform:uppercase; letter-spacing:.08em; margin:20px 0 8px; color:var(--moon-dim) }
-h3::before { content:"ᛝ"; margin-right:8px; color:var(--moon); opacity:.7; letter-spacing:0 }
+.moonlit h3::before { content:"ᛝ"; margin-right:8px; color:var(--moon); opacity:.7; letter-spacing:0 }
 b.o { color:var(--fg) } .checks td:nth-child(2) { color:#c3cad5 } h3.muted { color:var(--muted) }
 .tw { overflow-x:auto; border:1px solid var(--line); border-radius:8px }
 table.checks { width:100%; border-collapse:collapse; font-size:13.5px }
